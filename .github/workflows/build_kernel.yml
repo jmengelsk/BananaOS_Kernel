@@ -1,0 +1,154 @@
+name: Build LostPrime kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+          description: 'Upload release'
+          type: boolean
+          required: true
+          default: false
+      changelog:
+          description: 'Changelog'
+          type: string
+          required: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      release_ts: ${{ steps.ts.outputs.release_ts }}
+
+    steps:
+      - name: Generate release date
+        id: ts
+        run: |
+          RELEASE_TS=$(date +'%Y%m%d-%H%M%S')
+          echo "release_ts=$RELEASE_TS" >> $GITHUB_OUTPUT
+
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      release_ts: ${{ steps.ts.outputs.release_ts }}
+    needs: prepare
+
+    strategy:
+      matrix:
+        device:
+          - { name: m51, device2: m51nsxx, soc: sdmmagpie }
+        ksu_status: [ "y", "n" ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: Install build tools
+        run: |
+          sudo apt-get install -y \
+            build-essential \
+            git \
+            curl \
+            p7zip-full \
+            unzip \
+            wget \
+            zip \
+            zstd
+
+      - name: Cache clang
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: llvm-22
+          key: clang-r596125
+
+      - name: Download Prebuilt Android Clang
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          # clang-r596125 is only 570MB when compressed to 7z, 54.5% smaller in size!
+          # And I am hiding the DDL due to the quota issue :)
+          wget -O llvm.7z ${{ secrets.TOOLCHAIN_DDL }}
+          mkdir llvm-22;
+          7z x llvm.7z -ollvm-22
+          rm llvm.7z
+
+      - name: Build kernel
+        run: |
+          chmod +x build.sh
+          bash build.sh \
+            "${{ matrix.device.name }}" \
+            "${{ matrix.device.device2 }}" \
+            "${{ matrix.device.soc }}" \
+            "${{ matrix.ksu_status }}"
+
+      - name: Generate release notes
+        if: matrix.device.name == 'm51' && matrix.ksu_status == 'y'
+        run: |
+          : > version.txt
+          echo "![Downloads](https://img.shields.io/github/downloads/${{ github.repository }}/${{ needs.prepare.outputs.release_ts }}/total)" >> version.txt
+          echo >> version.txt
+          echo "**Kernel version:** $(cat out/include/config/kernel.release)  " >> version.txt
+          echo >> version.txt
+          export KHASH="$(git rev-parse HEAD)"
+          echo "**Kernel source:** [$KHASH](https://github.com/UN1CA/kernel_samsung_sm7150/tree/$KHASH)" >> version.txt
+
+          if [ "${{ github.event.inputs.release }}" = "true" ] && \
+             [ -n "${{ github.event.inputs.changelog }}" ]; then
+            echo >> version.txt
+            echo "**Changelog:**" >> version.txt
+            echo >> version.txt
+            printf "%b\n" "${{ github.event.inputs.changelog }}" >> version.txt
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: LostPrime-${{ matrix.device.name }}-${{ matrix.ksu_status == 'y' && 'ksu' || 'non-ksu' }}_${{ needs.prepare.outputs.release_ts }}
+          path: AnyKernel3/
+
+      - name: Upload release notes
+        if: matrix.device.name == 'm51' && matrix.ksu_status == 'y'
+        uses: actions/upload-artifact@v5
+        with:
+          name: release-notes
+          path: version.txt
+          retention-days: 1
+
+  release:
+    needs: [prepare, build]
+    if: github.event.inputs.release == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Zip build artifacts
+        run: |
+          cd artifacts
+          for dir in LostPrime-*; do
+            (
+              cd "$dir"
+              zip -r "../${dir}.zip" .
+            )
+          done
+
+      - name: Download release version
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: ./
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: version.txt
+          tag_name: "${{ needs.prepare.outputs.release_ts }}"
+          name: "LostPrime-${{ needs.prepare.outputs.release_ts }}"
+          files: artifacts/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
